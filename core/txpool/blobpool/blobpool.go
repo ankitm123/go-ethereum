@@ -478,7 +478,7 @@ func (p *BlobPool) parseTransaction(id uint64, size uint32, blob []byte) error {
 		log.Error("Rejecting duplicate blob pool entry", "id", id, "hash", tx.Hash())
 		return errors.New("duplicate blob entry")
 	}
-	sender, err := p.signer.Sender(tx)
+	sender, err := types.Sender(p.signer, tx)
 	if err != nil {
 		// This path is impossible unless the signature validity changes across
 		// restarts. For that ever improbable case, recover gracefully by ignoring
@@ -892,7 +892,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	// and accumulate the transactors and transactions
 	for rem.NumberU64() > add.NumberU64() {
 		for _, tx := range rem.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			discarded[from] = append(discarded[from], tx)
 			transactors[from] = struct{}{}
@@ -904,7 +904,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	}
 	for add.NumberU64() > rem.NumberU64() {
 		for _, tx := range add.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			included[from] = append(included[from], tx)
 			inclusions[tx.Hash()] = add.NumberU64()
@@ -917,7 +917,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 	}
 	for rem.Hash() != add.Hash() {
 		for _, tx := range rem.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			discarded[from] = append(discarded[from], tx)
 			transactors[from] = struct{}{}
@@ -927,7 +927,7 @@ func (p *BlobPool) reorg(oldHead, newHead *types.Header) (map[common.Address][]*
 			return nil, nil
 		}
 		for _, tx := range add.Transactions() {
-			from, _ := p.signer.Sender(tx)
+			from, _ := types.Sender(p.signer, tx)
 
 			included[from] = append(included[from], tx)
 			inclusions[tx.Hash()] = add.NumberU64()
@@ -1011,56 +1011,6 @@ func (p *BlobPool) reinject(addr common.Address, txhash common.Hash) error {
 	return nil
 }
 
-func (p *BlobPool) flushTransactionsBelowTip(tip *uint256.Int) {
-	for addr, txs := range p.index {
-		for i, tx := range txs {
-			if tx.execTipCap.Cmp(tip) < 0 {
-				// Drop the offending transaction
-				var (
-					ids    = []uint64{tx.id}
-					nonces = []uint64{tx.nonce}
-				)
-				p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[i].costCap)
-				p.stored -= uint64(tx.size)
-				delete(p.lookup, tx.hash)
-				txs[i] = nil
-
-				// Drop everything afterwards, no gaps allowed
-				for j, tx := range txs[i+1:] {
-					ids = append(ids, tx.id)
-					nonces = append(nonces, tx.nonce)
-
-					p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], tx.costCap)
-					p.stored -= uint64(tx.size)
-					delete(p.lookup, tx.hash)
-					txs[i+1+j] = nil
-				}
-				// Clear out the dropped transactions from the index
-				if i > 0 {
-					p.index[addr] = txs[:i]
-					heap.Fix(p.evict, p.evict.index[addr])
-				} else {
-					delete(p.index, addr)
-					delete(p.spent, addr)
-
-					heap.Remove(p.evict, p.evict.index[addr])
-					p.reserve(addr, false)
-				}
-				// Clear out the transactions from the data store
-				log.Warn("Dropping underpriced blob transaction", "from", addr, "rejected", tx.nonce, "tip", tx.execTipCap, "want", tip, "drop", nonces, "ids", ids)
-				dropUnderpricedMeter.Mark(int64(len(ids)))
-
-				for _, id := range ids {
-					if err := p.store.Delete(id); err != nil {
-						log.Error("Failed to delete dropped transaction", "id", id, "err", err)
-					}
-				}
-				break
-			}
-		}
-	}
-}
-
 // SetGasTip implements txpool.SubPool, allowing the blob pool's gas requirements
 // to be kept in sync with the main transaction pool's gas requirements.
 func (p *BlobPool) SetGasTip(tip *big.Int) {
@@ -1073,18 +1023,57 @@ func (p *BlobPool) SetGasTip(tip *big.Int) {
 
 	// If the min miner fee increased, remove transactions below the new threshold
 	if old == nil || p.gasTip.Cmp(old) > 0 {
-		p.flushTransactionsBelowTip(p.gasTip)
+		for addr, txs := range p.index {
+			for i, tx := range txs {
+				if tx.execTipCap.Cmp(p.gasTip) < 0 {
+					// Drop the offending transaction
+					var (
+						ids    = []uint64{tx.id}
+						nonces = []uint64{tx.nonce}
+					)
+					p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], txs[i].costCap)
+					p.stored -= uint64(tx.size)
+					delete(p.lookup, tx.hash)
+					txs[i] = nil
+
+					// Drop everything afterwards, no gaps allowed
+					for j, tx := range txs[i+1:] {
+						ids = append(ids, tx.id)
+						nonces = append(nonces, tx.nonce)
+
+						p.spent[addr] = new(uint256.Int).Sub(p.spent[addr], tx.costCap)
+						p.stored -= uint64(tx.size)
+						delete(p.lookup, tx.hash)
+						txs[i+1+j] = nil
+					}
+					// Clear out the dropped transactions from the index
+					if i > 0 {
+						p.index[addr] = txs[:i]
+						heap.Fix(p.evict, p.evict.index[addr])
+					} else {
+						delete(p.index, addr)
+						delete(p.spent, addr)
+
+						heap.Remove(p.evict, p.evict.index[addr])
+						p.reserve(addr, false)
+					}
+					// Clear out the transactions from the data store
+					log.Warn("Dropping underpriced blob transaction", "from", addr, "rejected", tx.nonce, "tip", tx.execTipCap, "want", tip, "drop", nonces, "ids", ids)
+					dropUnderpricedMeter.Mark(int64(len(ids)))
+
+					for _, id := range ids {
+						if err := p.store.Delete(id); err != nil {
+							log.Error("Failed to delete dropped transaction", "id", id, "err", err)
+						}
+					}
+					break
+				}
+			}
+		}
 	}
 	log.Debug("Blobpool tip threshold updated", "tip", tip)
 	pooltipGauge.Update(tip.Int64())
 	p.updateStorageMetrics()
-}
-
-func (p *BlobPool) FlushAllTransactions() {
-	maxUint256 := uint256.MustFromBig(new(big.Int).Sub(new(big.Int).Lsh(common.Big1, 256), common.Big1))
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.flushTransactionsBelowTip(maxUint256)
 }
 
 // validateTx checks whether a transaction is valid according to the consensus
@@ -1138,7 +1127,7 @@ func (p *BlobPool) validateTx(tx *types.Transaction) error {
 	// If the transaction replaces an existing one, ensure that price bumps are
 	// adhered to.
 	var (
-		from, _ = p.signer.Sender(tx) // already validated above
+		from, _ = types.Sender(p.signer, tx) // already validated above
 		next    = p.state.GetNonce(from)
 	)
 	if uint64(len(p.index[from])) > tx.Nonce()-next {
